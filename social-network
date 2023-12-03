@@ -1,0 +1,641 @@
+import sqlite3
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, g, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+import os
+
+# Configuration
+DATABASE = 'groups.db'
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
+app = Flask(__name__)
+app.config.from_object(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.secret_key = 's3cr3t'  # Change this to a random secret key
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def connect_db():
+    return sqlite3.connect(app.config['DATABASE'])
+
+def get_user_id(username):
+    db = connect_db()
+    user = db.execute('SELECT id FROM users WHERE username = ?', [username]).fetchone()
+    return user[0] if user else None
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        db = connect_db()
+        user = db.execute('SELECT * FROM users WHERE username = ?', [username]).fetchone()
+        if user and check_password_hash(user[2], password):
+            session['user_id'] = user[0]
+            return redirect(url_for('dashboard'))  # Redirect to landing page
+        else:
+            return 'Invalid credentials', 401
+    return render_template_string(login_template)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = generate_password_hash(request.form['password'])
+        name = request.form['name']
+        city = request.form['city']
+        description = request.form['description']
+        photo = request.files['photo']
+        if photo and allowed_file(photo.filename):
+            filename = secure_filename(photo.filename)
+            photo.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            photo_url = url_for('static', filename=os.path.join(app.config['UPLOAD_FOLDER'], filename))
+        else:
+            photo_url = None
+        db = connect_db()
+        db.execute(
+            'INSERT INTO users (username, password, name, city, description, photo_url) VALUES (?, ?, ?, ?, ?, ?)',
+            [username, password, name, city, description, photo_url]
+        )
+        db.commit()
+        return redirect(url_for('dashboard'))  # Redirect to landing page
+    return render_template_string(register_template)  # Updated to use a file for the template
+
+
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    return redirect(url_for('login'))
+
+@app.route('/profile/<int:user_id>')
+def profile(user_id):
+    db = connect_db()
+    user = db.execute('SELECT * FROM users WHERE id = ?', [user_id]).fetchone()
+    return render_template_string(profile_template, user=user)
+
+@app.route('/create_group', methods=['GET', 'POST'])
+def create_group():
+    if request.method == 'POST':
+        name = request.form['name']
+        description = request.form['description']
+        db = connect_db()
+        db.execute('INSERT INTO groups (name, description) VALUES (?, ?)', [name, description])
+        db.commit()
+        group_id = db.execute('SELECT last_insert_rowid()').fetchone()[0]
+        return redirect(url_for('view_group', group_id=group_id))
+    return render_template_string(create_group_template)
+
+@app.route('/join_group/<int:group_id>')
+def join_group(group_id):
+    user_id = session['user_id']  # Get user_id from session
+    db = connect_db()
+    db.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', [group_id, user_id])
+    db.commit()
+    return redirect(url_for('view_group', group_id=group_id))
+
+
+@app.route('/view_group/<int:group_id>')
+def view_group(group_id):
+    db = connect_db()
+    group = db.execute('SELECT * FROM groups WHERE id = ?', [group_id]).fetchone()
+    posts = db.execute(
+        '''SELECT posts.id, posts.content, posts.timestamp, users.name, users.photo_url
+           FROM posts JOIN users ON posts.user_id = users.id
+           WHERE posts.group_id = ? ORDER BY posts.timestamp DESC''',
+        [group_id]
+    ).fetchall()
+    comments = db.execute(
+        '''SELECT comments.id, comments.content, comments.timestamp, users.name, users.photo_url
+           FROM comments JOIN users ON comments.user_id = users.id
+           ORDER BY comments.timestamp ASC'''
+    ).fetchall()
+    return render_template_string(view_group_template, group=group, posts=posts, comments=comments)
+
+@app.route('/dashboard')
+def dashboard():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    return render_template_string(dashboard_template)
+
+@app.route('/create_post/<int:group_id>', methods=['GET', 'POST'])
+def create_post(group_id):
+    if request.method == 'POST':
+        content = request.form['content']
+        user_id = session['user_id']
+        db = connect_db()
+        db.execute('INSERT INTO posts (user_id, group_id, content) VALUES (?, ?, ?)', [user_id, group_id, content])
+        db.commit()
+        return redirect(url_for('view_group', group_id=group_id))
+    return render_template_string(create_post_template)
+
+@app.route('/create_comment/<int:post_id>', methods=['GET', 'POST'])
+def create_comment(post_id):
+    if request.method == 'POST':
+        content = request.form['content']
+        user_id = session['user_id']
+        db = connect_db()
+        db.execute('INSERT INTO comments (user_id, post_id, content) VALUES (?, ?, ?)', [user_id, post_id, content])
+        db.commit()
+        # Redirect to the post where the comment was made
+        group_id = db.execute('SELECT group_id FROM posts WHERE id = ?', [post_id]).fetchone()[0]
+        return redirect(url_for('view_group', group_id=group_id))
+    return render_template_string(create_comment_template)
+
+
+@app.route('/view_post/<int:post_id>')
+def view_post(post_id):
+    db = connect_db()
+    post = db.execute(
+        '''SELECT posts.id, posts.content, posts.timestamp, users.name, users.photo_url
+           FROM posts JOIN users ON posts.user_id = users.id
+           WHERE posts.id = ?''',
+        [post_id]
+    ).fetchone()
+    comments = db.execute(
+        '''SELECT comments.id, comments.content, comments.timestamp, users.name, users.photo_url
+           FROM comments JOIN users ON comments.user_id = users.id
+           WHERE comments.post_id = ? ORDER BY comments.timestamp ASC''',
+        [post_id]
+    ).fetchall()
+    return render_template_string(view_post_template, post=post, comments=comments)
+
+@app.route('/landing')
+def landing():
+    db = connect_db()
+    groups = db.execute('SELECT * FROM groups').fetchall()
+    return render_template_string(landing_template, groups=groups)
+
+bootstrap_links = '''
+<link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+<script src="https://code.jquery.com/jquery-3.2.1.slim.min.js"></script>
+<script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
+'''
+
+dashboard_template = f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard</title>
+    {bootstrap_links}
+</head>
+<body class="bg-light">
+<div class="container">
+    <div class="py-5 text-center">
+        <h2>Welcome to the Dashboard</h2>
+    </div>
+    <div class="row">
+        <div class="col-md-4">
+            <div class="list-group">
+                <a href="{{ url_for('create_group') }}" class="list-group-item list-group-item-action">Create Group</a>
+                <a href="#" class="list-group-item list-group-item-action">Your Groups</a>
+                <a href="#" class="list-group-item list-group-item-action">Find Groups</a>
+                <a href="{{ url_for('profile', user_id=session['user_id']) }}" class="list-group-item list-group-item-action">Your Profile</a>
+                <a href="{{ url_for('logout') }}" class="list-group-item list-group-item-action text-danger">Logout</a>
+            </div>
+        </div>
+        <div class="col-md-8">
+            <!-- Content Area -->
+        </div>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+base_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Social Network</title>
+</head>
+<body>
+{% if 'user_id' in session %}
+    {% with user = get_user(session['user_id']) %}
+        <div id="header">
+            <img src="{{ user[6] }}" alt="{{ user[3] }}'s Profile Photo">
+            <p>Welcome, {{ user[3] }}!</p>
+        </div>
+    {% endwith %}
+{% endif %}
+{% block content %}{% endblock %}
+</body>
+</html>
+'''
+
+def get_user(user_id):
+    db = connect_db()
+    user = db.execute('SELECT * FROM users WHERE id = ?', [user_id]).fetchone()
+    return user
+
+
+landing_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <title>Landing Page</title>
+</head>
+<body>
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-6 text-center">
+            <h1 class="mt-5">Welcome to Our Social Network</h1>
+            <p class="lead mt-4">Connect with people in your city and join groups of your interest.</p>
+            <div class="mt-4">
+                <a href="{{ url_for('login') }}" class="btn btn-primary">Login</a>
+                <a href="{{ url_for('register') }}" class="btn btn-secondary">Register</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.7/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
+'''
+
+
+
+# HTML Templates
+register_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <title>Register</title>
+</head>
+<body>
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <h1 class="text-center mt-5">Register</h1>
+            <form method="post" enctype="multipart/form-data" class="mt-4">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label for="name">Name</label>
+                    <input type="text" id="name" name="name" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label for="city">City</label>
+                    <input type="text" id="city" name="city" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label for="description">Description</label>
+                    <textarea id="description" name="description" class="form-control"></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="photo">Profile Photo</label>
+                    <input type="file" id="photo" name="photo" class="form-control-file">
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Submit</button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.7/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
+'''
+
+login_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <title>Login</title>
+</head>
+<body>
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-6">
+            <h2 class="text-center mt-5">Login</h2>
+            <form method="post" class="mt-4">
+                <div class="form-group">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" class="form-control" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" class="form-control" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Submit</button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.7/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
+'''
+
+
+profile_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <title>{{ user[3] }}'s Profile</title>
+</head>
+<body>
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-6 text-center">
+            <h1 class="mt-5">{{ user[3] }}</h1>
+            <p>City: {{ user[4] }}</p>
+            <p>{{ user[5] }}</p>
+            {% if user[6] %}
+                <img src="{{ url_for('static', filename=user[6]) }}" alt="Profile Photo" class="img-fluid rounded-circle">
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.7/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
+'''
+
+
+create_group_template = f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create Group</title>
+    {bootstrap_links}
+</head>
+<body class="bg-light">
+<div class="container">
+    <div class="py-5 text-center">
+        <h2>Create Group</h2>
+    </div>
+    <div class="row">
+        <div class="col-md-12">
+            <form method="post" class="needs-validation" novalidate>
+                <div class="mb-3">
+                    <label for="name">Group Name</label>
+                    <input type="text" class="form-control" id="name" name="name" required>
+                    <div class="invalid-feedback">
+                        Valid group name is required.
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label for="description">Description</label>
+                    <input type="text" class="form-control" id="description" name="description" required>
+                    <div class="invalid-feedback">
+                        Valid description is required.
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-lg btn-block" type="submit">Submit</button>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+
+
+view_group_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <title>View Group</title>
+</head>
+<body>
+<div class="container">
+    <h1 class="mt-5">{{ group[1] }}</h1>
+    <p>{{ group[2] }}</p>
+    <a href="{{ url_for('create_post', group_id=group[0]) }}" class="btn btn-primary mb-3">Create Post</a>
+    <ul class="list-group">
+        {% for post in posts %}
+            <li class="list-group-item">
+                <h5>{{ post[3] }} (Posted by user {{ post[1] }} at {{ post[4] }})</h5>
+                <a href="{{ url_for('view_post', post_id=post[0]) }}" class="btn btn-secondary btn-sm">View & Comment</a>
+            </li>
+        {% endfor %}
+    </ul>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.7/dist/umd/popper.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>
+'''
+
+
+
+create_post_template = f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create Post</title>
+    {bootstrap_links}
+</head>
+<body class="bg-light">
+<div class="container">
+    <div class="py-5 text-center">
+        <h2>Create Post</h2>
+    </div>
+    <div class="row">
+        <div class="col-md-12">
+            <form method="post" class="needs-validation" novalidate>
+                <div class="mb-3">
+                    <label for="content">Post Content</label>
+                    <textarea class="form-control" id="content" name="content" required></textarea>
+                    <div class="invalid-feedback">
+                        Valid content is required.
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-lg btn-block" type="submit">Submit</button>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+# ... Other parts of your Flask application
+
+# HTML Templates
+
+create_comment_template = f'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create Comment</title>
+    {bootstrap_links}
+</head>
+<body class="bg-light">
+<div class="container">
+    <div class="py-5 text-center">
+        <h2>Create Comment</h2>
+    </div>
+    <div class="row">
+        <div class="col-md-12">
+            <form method="post" class="needs-validation" novalidate>
+                <div class="mb-3">
+                    <label for="content">Comment Content</label>
+                    <textarea class="form-control" id="content" name="content" required></textarea>
+                    <div class="invalid-feedback">
+                        Valid content is required.
+                    </div>
+                </div>
+                <button class="btn btn-primary btn-lg btn-block" type="submit">Submit</button>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+view_post_template = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Post</title>
+    {bootstrap_links}
+</head>
+<body class="bg-light">
+<div class="container">
+    <div class="py-5 text-center">
+        <h2>{{ post[3] }}</h2>
+        <p class="lead">Posted by {{ post[1] }} at {{ post[4] }}</p>
+    </div>
+    <div class="row">
+        <div class="col-md-12">
+            <h4 class="mb-3">Comments</h4>
+            <ul class="list-group mb-3">
+                {% for comment in comments %}
+                    <li class="list-group-item d-flex justify-content-between lh-condensed">
+                        <div>
+                            <h6 class="my-0">{{ comment[3] }} commented at {{ comment[4] }}</h6>
+                            <small class="text-muted">{{ comment[1] }}</small>
+                        </div>
+                    </li>
+                {% endfor %}
+            </ul>
+            <a class="btn btn-primary btn-lg btn-block" href="{{ url_for('create_comment', post_id=post[0]) }}">Add Comment</a>
+        </div>
+    </div>
+</div>
+</body>
+</html>
+'''
+
+# ... Other parts of your Flask application
+
+
+
+
+
+# Database schema
+schema = '''
+DROP TABLE IF EXISTS groups;
+DROP TABLE IF EXISTS group_members;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS posts;
+DROP TABLE IF EXISTS comments;
+
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL
+);
+CREATE TABLE group_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES groups(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    password TEXT NOT NULL,
+    name TEXT,
+    city TEXT,
+    description TEXT,
+    photo_url TEXT
+);
+CREATE TABLE posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    group_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (group_id) REFERENCES groups(id)
+);
+CREATE TABLE comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    post_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (post_id) REFERENCES posts(id)
+);
+'''
+
+def init_db():
+    with app.app_context():
+        db = connect_db()
+        db.cursor().executescript(schema)
+        db.commit()
+
+@app.teardown_appcontext
+def close_db(error):
+    if hasattr(g, 'sqlite_db'):
+        g.sqlite_db.close()
+
+if __name__ == '__main__':
+    if not os.path.exists(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER)
+    init_db()
+    app.run(debug=True)
