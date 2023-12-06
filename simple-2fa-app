@@ -1,0 +1,31 @@
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.button import Button
+import pyotp
+
+class TwoFactorApp(App):
+    def build(self):
+        layout = BoxLayout(orientation='vertical')
+        self.secret_key_input = TextInput(hint_text='Enter Secret Key', multiline=False)
+        self.otp_label = Label(text='Your OTP will appear here')
+        self.generate_button = Button(text='Generate OTP')
+        self.generate_button.bind(on_press=self.generate_otp)
+
+        layout.add_widget(self.secret_key_input)
+        layout.add_widget(self.generate_button)
+        layout.add_widget(self.otp_label)
+
+        return layout
+
+    def generate_otp(self, instance):
+        secret_key = self.secret_key_input.text
+        if secret_key:
+            totp = pyotp.TOTP(secret_key)
+            self.otp_label.text = f'Current OTP: {totp.now()}'
+        else:
+            self.otp_label.text = 'Please enter a valid secret key'
+
+if __name__ == '__main__':
+    TwoFactorApp().run()
